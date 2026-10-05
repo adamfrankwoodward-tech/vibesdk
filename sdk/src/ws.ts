@@ -35,6 +35,7 @@ export function createAgentConnection(
 	let ws: WebSocket | null = null;
 	let isOpen = false;
 	let closedByUser = false;
+	let connectionGeneration = 0;
 	let reconnectAttempts = 0;
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -199,6 +200,7 @@ export function createAgentConnection(
 
 	async function connectNow(): Promise<void> {
 		if (closedByUser) return;
+		const generation = ++connectionGeneration;
 		clearReconnectTimer();
 
 		if (typeof WebSocket === 'undefined') {
@@ -212,6 +214,7 @@ export function createAgentConnection(
 
 		try {
 			const url = await getUrl();
+			if (closedByUser || generation !== connectionGeneration) return;
 			ws = new WebSocket(url);
 
 			ws.addEventListener('open', onOpen);
@@ -219,6 +222,7 @@ export function createAgentConnection(
 			ws.addEventListener('error', onError);
 			ws.addEventListener('message', onMessage);
 		} catch (error) {
+			if (closedByUser || generation !== connectionGeneration) return;
 			emitter.emit('ws:error', {
 				error: error instanceof Error ? error : new Error(String(error)),
 			});
@@ -247,6 +251,7 @@ export function createAgentConnection(
 
 	function close(): void {
 		closedByUser = true;
+		connectionGeneration += 1;
 		isOpen = false;
 		pendingSends.length = 0;
 		clearReconnectTimer();
