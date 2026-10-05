@@ -46,13 +46,17 @@ export class DORateLimitStore extends DurableObject<Env> {
         buckets: new Map(),
         lastCleanup: Date.now()
     };
-    private initialized = false;
+    private initializationPromise?: Promise<void>;
 
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env);
     }
 
     async increment(key: string, config: RateLimitConfig, incrementBy: number = 1): Promise<RateLimitResult> {
+        if (!Number.isFinite(incrementBy) || incrementBy < 0) {
+            return { success: false };
+        }
+
         await this.ensureInitialized();
         
         const now = Date.now();
@@ -80,7 +84,7 @@ export class DORateLimitStore extends DurableObject<Env> {
         const dailyCount = dailyBuckets.reduce((sum, bucket) => sum + bucket.count, 0);
 
         // Check limits
-        if (mainCount >= config.limit) {
+        if (incrementBy > 0 && mainCount + incrementBy > config.limit) {
             return {
                 success: false,
                 remainingLimit: 0,
@@ -90,7 +94,7 @@ export class DORateLimitStore extends DurableObject<Env> {
             };
         }
 
-        if (config.burst && burstCount >= config.burst) {
+        if (incrementBy > 0 && config.burst && burstCount + incrementBy > config.burst) {
             return {
                 success: false,
                 remainingLimit: 0,
@@ -100,7 +104,7 @@ export class DORateLimitStore extends DurableObject<Env> {
             };
         }
 
-        if (config.dailyLimit && dailyCount >= config.dailyLimit) {
+        if (incrementBy > 0 && config.dailyLimit && dailyCount + incrementBy > config.dailyLimit) {
             return {
                 success: false,
                 remainingLimit: 0,
@@ -110,16 +114,15 @@ export class DORateLimitStore extends DurableObject<Env> {
             };
         }
 
-        // Increment current bucket
-        const existing = this.state.buckets.get(bucketKey);
-        const newCount = (existing?.count || 0) + incrementBy;
-        
-        this.state.buckets.set(bucketKey, {
-            count: newCount,
-            timestamp: now
-        });
+        if (incrementBy > 0) {
+            const existing = this.state.buckets.get(bucketKey);
+            this.state.buckets.set(bucketKey, {
+                count: (existing?.count || 0) + incrementBy,
+                timestamp: now
+            });
 
-        await this.persistState();
+            await this.persistState();
+        }
 
         // Compute remaining across applicable windows
         const mainRemaining = config.limit - mainCount - incrementBy;
@@ -211,21 +214,23 @@ export class DORateLimitStore extends DurableObject<Env> {
     }
 
     private async ensureInitialized(): Promise<void> {
-        if (!this.initialized) {
-            const stored = await this.ctx.storage.get<{
+        if (!this.initializationPromise) {
+            this.initializationPromise = this.ctx.storage.get<{
                 buckets: [string, RateLimitBucket][];
                 lastCleanup: number;
-            }>('state');
-            
-            if (stored) {
-                this.state = {
-                    buckets: new Map(stored.buckets),
-                    lastCleanup: stored.lastCleanup
-                };
-            }
-            
-            this.initialized = true;
+            }>('state').then((stored) => {
+                if (stored) {
+                    this.state = {
+                        buckets: new Map(stored.buckets),
+                        lastCleanup: stored.lastCleanup
+                    };
+                }
+            }).catch((error: unknown) => {
+                this.initializationPromise = undefined;
+                throw error;
+            });
         }
+        await this.initializationPromise;
     }
 
     private async persistState(): Promise<void> {
