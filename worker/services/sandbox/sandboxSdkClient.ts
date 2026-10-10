@@ -1013,7 +1013,13 @@ export class SandboxSdkClient extends BaseSandboxService {
                         };
                     } else {
                         this.logger.error('Instance already exists but is not active, Removing old instance', { instance: firstInstance });
-                        await this.shutdownInstance(firstInstance.runId);
+                        const shutdown = await this.shutdownInstance(firstInstance.runId);
+                        if (!shutdown.success) {
+                            return {
+                                success: false,
+                                error: shutdown.error || `Failed to remove old instance ${firstInstance.runId}`
+                            };
+                        }
                     }
                 }
             
@@ -1181,7 +1187,10 @@ export class SandboxSdkClient extends BaseSandboxService {
 
     async shutdownInstance(instanceId: string): Promise<ShutdownResponse> {
         try {
-            // Check if instance exists 
+            // Cleanup must stay within this instance's directory in pooled sandboxes.
+            if (!/^[a-zA-Z0-9_-]+$/.test(instanceId) || instanceId === 'sandbox-default') {
+                return { success: false, error: 'Invalid instance ID for cleanup' };
+            }
             const metadata = await this.getInstanceMetadata(instanceId);
             if (!metadata) {
                 return {
@@ -1194,26 +1203,73 @@ export class SandboxSdkClient extends BaseSandboxService {
 
             const sandbox = this.getSandbox();
             
+            const errors: string[] = [];
+            const errorMessage = (error: unknown): string =>
+                error instanceof Error ? error.message : String(error);
+
             if (metadata.processId) {
+                let killError: unknown;
                 try {
                     await sandbox.killProcess(metadata.processId);
                 } catch (error) {
-                    this.logger.warn(`Failed to kill process ${metadata.processId}`, error);
+                    killError = error;
+                }
+                try {
+                    const processes = await sandbox.listProcesses();
+                    const process = processes.find(p => p.id === metadata.processId);
+                    if (process && !['completed', 'failed', 'killed', 'error'].includes(process.status)) {
+                        errors.push(
+                            `Process ${metadata.processId} is still ${process.status}${killError ? `: ${errorMessage(killError)}` : ''}`
+                        );
+                    }
+                } catch (error) {
+                    errors.push(
+                        `Failed to confirm process ${metadata.processId} stopped: ${errorMessage(error)}${killError ? ` (kill failed: ${errorMessage(killError)})` : ''}`
+                    );
                 }
             }
-            
-            // Unexpose the allocated port if we know what it was
+
             if (metadata.allocatedPort) {
+                let unexposeError: unknown;
                 try {
                     await sandbox.unexposePort(metadata.allocatedPort);
-                    this.logger.info(`Unexposed port ${metadata.allocatedPort} for instance ${instanceId}`);
                 } catch (error) {
-                    this.logger.warn(`Failed to unexpose port ${metadata.allocatedPort}`, error);
+                    unexposeError = error;
+                }
+                try {
+                    const ports = await sandbox.getExposedPorts(getPreviewDomain(env));
+                    if (ports.some(port => port.port === metadata.allocatedPort)) {
+                        errors.push(
+                            `Port ${metadata.allocatedPort} is still exposed${unexposeError ? `: ${errorMessage(unexposeError)}` : ''}`
+                        );
+                    }
+                } catch (error) {
+                    errors.push(
+                        `Failed to confirm port ${metadata.allocatedPort} unexposed: ${errorMessage(error)}${unexposeError ? ` (unexpose failed: ${errorMessage(unexposeError)})` : ''}`
+                    );
                 }
             }
-            
-            // Clean up files
-            await this.safeSandboxExec(`rm -rf ${instanceId}`);
+
+            try {
+                const path = `'/workspace/${instanceId}'`;
+                const result = await this.safeSandboxExec(`rm -rf -- ${path} && test ! -e ${path} && test ! -L ${path}`);
+                if (result.exitCode !== 0) {
+                    errors.push(
+                        `Failed to remove instance files (exit ${result.exitCode}): ${result.stderr || result.stdout}`
+                    );
+                }
+            } catch (error) {
+                errors.push(`Failed to remove instance files: ${errorMessage(error)}`);
+            }
+
+            // Keep retry state until all instance resources are confirmed gone.
+            if (errors.length > 0) {
+                this.logger.warn('Partial instance cleanup failure', { instanceId, errors });
+                return {
+                    success: false,
+                    error: `Failed to shutdown instance ${instanceId}: ${errors.join('; ')}`
+                };
+            }
 
             // Invalidate session cache
             this.invalidateSessionCache(instanceId);
